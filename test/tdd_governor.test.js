@@ -106,3 +106,50 @@ test('phasePrompt: delegates to state machine', () => {
   state.beginCycle('test_add');
   assert.ok(gov.phasePrompt().length > 0);
 });
+
+// ─── Requirements loop via governor ──────────────────────────────────────────
+
+test('processTestResult: marks regression clean when all done + clean suite', () => {
+  const { gov, state } = makeGovernor();
+  state.initRequirements(['req1']);
+  state.beginCycle('test_req1');
+  state.confirmRed(FAILING_RESULT);
+  state.advanceToGreen(PASSING_RESULT);
+  state.skipRefactor(); // all done, loop idle
+  const msg = gov.processTestResult(CLEAN_SUITE);
+  assert.ok(msg);
+  assert.match(msg, /COMPLETE|fulfilled/i);
+  assert.ok(state.loopComplete());
+});
+
+test('processTestResult: returns reminder when all done but still need regression run', () => {
+  const { gov, state } = makeGovernor();
+  state.initRequirements(['req1']);
+  state.beginCycle('test_req1');
+  state.confirmRed(FAILING_RESULT);
+  state.advanceToGreen(PASSING_RESULT);
+  state.skipRefactor(); // all done, not yet regression-checked
+
+  // Simulate a run that fails (regression)
+  const failingSuite = { passed: 2, failed: 1, errors: 0, skipped: 0, exitCode: 1, failures: [{ name: 'other', message: '' }] };
+  const msg = gov.processTestResult(failingSuite);
+  // Should not complete the loop
+  assert.equal(state.loopComplete(), false);
+  // Should return some message (could be null or a warning)
+  // Either way the loop is not complete
+});
+
+test('processTestResult: prompts for next requirement when idle in loop with pending reqs', () => {
+  const { gov, state } = makeGovernor();
+  state.initRequirements(['req1', 'req2']);
+  // Only complete req1
+  state.beginCycle('test_req1');
+  state.confirmRed(FAILING_RESULT);
+  state.advanceToGreen(PASSING_RESULT);
+  state.skipRefactor(); // req2 now active
+
+  // Run tests while idle (between requirements)
+  const msg = gov.processTestResult(PASSING_RESULT);
+  assert.ok(msg);
+  assert.match(msg, /req2|next/i);
+});

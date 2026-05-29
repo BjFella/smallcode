@@ -1,34 +1,43 @@
 // SmallCode — TDD State Machine
 //
-// Tracks the Red → Green → Refactor cycle so the agent loop can gate tool
-// availability and enforce phase discipline. Without this, a small model
-// skips straight to writing implementation (not TDD).
+// Tracks the Red → Green → Refactor cycle and — when a requirements list is
+// provided — loops through every requirement until all have passing tests.
 //
-// Phase model:
+// Two modes of operation:
 //
-//   idle      No TDD cycle in progress. All tools available.
-//   red       A new failing test was written. The agent MUST call run_tests
-//             and confirm the target test fails before writing implementation.
-//             Writing implementation files is permitted only after confirmRed().
-//   green     The target test now passes. The agent MUST NOT modify test files.
-//             It may only edit implementation files to reach green.
-//   refactor  Implementation is green. Agent may restructure — but only
-//             structural changes. A clean full-suite run is required before
-//             the cycle is considered complete.
+//   Single-cycle mode  — call beginCycle(testName) directly.
+//                        Works as before: one cycle, then idle.
+//
+//   Loop mode          — call initRequirements(list) first, then the machine
+//                        automatically advances to the next pending requirement
+//                        after each completeCycle()/skipRefactor(). The loop
+//                        ends only when all requirements have passing tests AND
+//                        a clean full-suite regression run passes.
+//
+// Phase model (same for both modes):
+//
+//   idle      No cycle in progress. Loop mode: may still have pending requirements.
+//   red       Test written; agent MUST confirm it fails before writing impl.
+//   green     Target test passes. Agent must not modify test files.
+//   refactor  Structural cleanup. Clean full-suite run required to finish.
 //
 // Transitions:
 //
-//   idle  ──beginCycle(testName)──►  red
-//   red   ──confirmRed(result)──►    red (confirmed=true)
-//   red   ──advanceToGreen(result)── green   (requires confirmRed first)
+//   any ──initRequirements(list)──►  idle (requirements registered, loop armed)
+//   idle ──beginCycle(name)──►       red
+//   red  ──confirmRed(result)──►     red (confirmed=true)
+//   red  ──advanceToGreen(result)──► green  (requires confirmRed)
 //   green ──enterRefactor()──►       refactor
-//   refactor ──completeCycle(result)─► idle  (requires clean full-suite run)
-//   any   ──reset()──►               idle
+//   refactor ──completeCycle(r)──►   idle or red (next req, loop mode)
+//   green ──skipRefactor()──►        idle or red (next req, loop mode)
+//   any  ──reset()──►                idle (clears requirements too)
 //
-// Persistence:
-//   State is written to .smallcode/tdd_state.json on every transition so it
-//   survives session restarts. On load, the machine resumes from the last
-//   persisted phase.
+// Requirement statuses: 'pending' | 'active' | 'done'
+//
+// Loop completion:  allRequirementsDone() + a clean full-suite run (tracked
+//                   via markRegressionClean() called by the governor).
+//
+// Persistence: .smallcode/tdd_state.json — survives session restarts.
 //
 // Configuration:
 //   SMALLCODE_TDD=false    disable entirely (machine stays idle, no gates fire)
@@ -45,6 +54,12 @@ const PHASES = Object.freeze({
   REFACTOR: 'refactor',
 });
 
+const REQ_STATUS = Object.freeze({
+  PENDING: 'pending',
+  ACTIVE: 'active',
+  DONE: 'done',
+});
+
 const FILE_MODE = 0o600;
 
 class TDDStateMachine {
@@ -54,12 +69,17 @@ class TDDStateMachine {
     this._stateFile = options.stateFile
       || path.join(this.workdir, '.smallcode', 'tdd_state.json');
 
-    // In-memory state
+    // Single-cycle state
     this._phase = PHASES.IDLE;
     this._targetTest = null;
     this._redConfirmed = false;
     this._cycleId = 0;
     this._startedAt = null;
+
+    // Loop state
+    this._requirements = [];      // [{ id, text, status }]
+    this._loopActive = false;     // true when initRequirements() was called
+    this._regressionClean = false; // true when a clean full-suite run has been confirmed
 
     if (!this.disabled) {
       this._load();
@@ -71,6 +91,8 @@ class TDDStateMachine {
   get phase() { return this._phase; }
   get targetTest() { return this._targetTest; }
   get redConfirmed() { return this._redConfirmed; }
+  get requirements() { return this._requirements; }
+  get loopActive() { return this._loopActive; }
 
   isIdle()     { return this._phase === PHASES.IDLE; }
   isRed()      { return this._phase === PHASES.RED; }
@@ -78,20 +100,130 @@ class TDDStateMachine {
   isRefactor() { return this._phase === PHASES.REFACTOR; }
   isActive()   { return this._phase !== PHASES.IDLE; }
 
-  // ─── Transitions ───────────────────────────────────────────────────────────
+  pendingRequirements() { return this._requirements.filter(r => r.status === REQ_STATUS.PENDING); }
+  doneRequirements()    { return this._requirements.filter(r => r.status === REQ_STATUS.DONE); }
+  activeRequirement()   { return this._requirements.find(r => r.status === REQ_STATUS.ACTIVE) || null; }
+
+  /** True when every requirement is done. Does NOT include the regression check. */
+  allRequirementsDone() {
+    return this._loopActive
+      && this._requirements.length > 0
+      && this._requirements.every(r => r.status === REQ_STATUS.DONE);
+  }
+
+  /** True when all requirements are done AND a clean full-suite run was confirmed. */
+  loopComplete() {
+    return this.allRequirementsDone() && this._regressionClean;
+  }
+
+  // ─── Requirements loop ─────────────────────────────────────────────────────
 
   /**
-   * Start a new TDD cycle for the named test.
-   * Call this after writing the failing test, before running it.
-   * Moves to the RED phase.
+   * Arm the loop with a list of requirements.
+   * Each entry is a plain-English description of behaviour to implement.
+   * Does not start a cycle — call beginCycle() or let the governor auto-start.
    *
-   * @param {string} testName - The specific test identifier to track (e.g. "test_add" or "src/math.test.js > adds numbers")
-   * @returns {{ ok: boolean, phase: string, message: string }}
+   * @param {string[]} requirements
+   * @returns {{ ok: boolean, message: string, requirements: object[] }}
+   */
+  initRequirements(requirements) {
+    if (this.disabled) return { ok: true, message: 'TDD gating disabled.', requirements: [] };
+    if (!Array.isArray(requirements) || requirements.length === 0) {
+      return { ok: false, message: 'initRequirements: pass a non-empty array of requirement strings.' };
+    }
+
+    this._requirements = requirements
+      .map((text, i) => String(text || '').trim())
+      .filter(Boolean)
+      .map((text, i) => ({ id: `r${String(i + 1).padStart(2, '0')}`, text, status: REQ_STATUS.PENDING }));
+
+    if (this._requirements.length === 0) {
+      return { ok: false, message: 'initRequirements: all requirement strings were empty.' };
+    }
+
+    this._loopActive = true;
+    this._regressionClean = false;
+    // Reset any in-flight cycle
+    this._phase = PHASES.IDLE;
+    this._targetTest = null;
+    this._redConfirmed = false;
+    this._save();
+
+    const lines = this._requirements.map(r => `  ○ ${r.id}: ${r.text}`).join('\n');
+    return {
+      ok: true,
+      message: `TDD loop initialised with ${this._requirements.length} requirement(s):\n${lines}\n\nNext: write a failing test for "${this._requirements[0].text}", then call tdd_begin_cycle.`,
+      requirements: this._requirements,
+    };
+  }
+
+  /**
+   * Mark a requirement as complete (used internally after a cycle reaches green).
+   * If loopActive, auto-starts the next pending requirement's cycle.
+   *
+   * @param {string} reqId
+   * @returns {{ ok: boolean, advanced: boolean, next: object|null, message: string }}
+   */
+  _completeRequirement(reqId) {
+    const req = this._requirements.find(r => r.id === reqId);
+    if (!req) return { ok: false, advanced: false, next: null, message: `Requirement ${reqId} not found.` };
+
+    req.status = REQ_STATUS.DONE;
+    this._save();
+
+    const next = this._requirements.find(r => r.status === REQ_STATUS.PENDING);
+    if (next) {
+      next.status = REQ_STATUS.ACTIVE;
+      this._save();
+      return {
+        ok: true,
+        advanced: true,
+        next,
+        message: `✓ "${req.text}" done. Moving to next: "${next.text}" (${next.id}).`,
+      };
+    }
+
+    const done = this.doneRequirements().length;
+    const total = this._requirements.length;
+    return {
+      ok: true,
+      advanced: false,
+      next: null,
+      message: `✓ All ${total} requirement(s) implemented. Run run_tests (full suite) to confirm no regressions, then the loop is complete.`,
+    };
+  }
+
+  /**
+   * Mark that a clean full-suite run was observed. Only meaningful after
+   * allRequirementsDone() is true. Called by the governor.
+   */
+  markRegressionClean() {
+    if (!this.allRequirementsDone()) return false;
+    this._regressionClean = true;
+    this._save();
+    return true;
+  }
+
+  // ─── Single-cycle transitions ───────────────────────────────────────────────
+
+  /**
+   * Start a TDD cycle for testName. In loop mode, also links the cycle to
+   * the currently-active requirement (or the first pending one if none active).
    */
   beginCycle(testName) {
     if (this.disabled) return { ok: true, phase: 'idle', message: 'TDD gating disabled.' };
     if (!testName || typeof testName !== 'string' || !testName.trim()) {
       return { ok: false, phase: this._phase, message: 'beginCycle requires a non-empty testName.' };
+    }
+
+    // In loop mode, mark the associated requirement as active
+    if (this._loopActive) {
+      const activeReq = this.activeRequirement();
+      if (!activeReq) {
+        // Try to activate the first pending requirement
+        const first = this._requirements.find(r => r.status === REQ_STATUS.PENDING);
+        if (first) first.status = REQ_STATUS.ACTIVE;
+      }
     }
 
     this._phase = PHASES.RED;
@@ -104,25 +236,17 @@ class TDDStateMachine {
     return {
       ok: true,
       phase: PHASES.RED,
-      message: `TDD cycle started for "${this._targetTest}". Now run_tests to confirm it fails (RED phase).`,
+      message: `TDD cycle started for "${this._targetTest}". Call run_tests (with test_filter "${this._targetTest}") to confirm it fails (RED phase).`,
     };
   }
 
-  /**
-   * Record that run_tests was called and confirmed the target test is FAILING.
-   * Must be called before advanceToGreen is allowed.
-   *
-   * @param {object} testResult - Structured result from run_tests
-   * @returns {{ ok: boolean, phase: string, message: string }}
-   */
   confirmRed(testResult) {
     if (this.disabled) return { ok: true, phase: 'idle', message: 'TDD gating disabled.' };
     if (this._phase !== PHASES.RED) {
       return { ok: false, phase: this._phase, message: `confirmRed called but phase is "${this._phase}", expected "red".` };
     }
 
-    const targetFailing = this._isTargetFailing(testResult);
-    if (!targetFailing && testResult && testResult.failed === 0 && testResult.exitCode === 0) {
+    if (!this._isTargetFailing(testResult) && testResult && testResult.failed === 0 && testResult.exitCode === 0) {
       return {
         ok: false,
         phase: PHASES.RED,
@@ -137,16 +261,10 @@ class TDDStateMachine {
     return {
       ok: true,
       phase: PHASES.RED,
-      message: `RED confirmed: "${this._targetTest}" is failing as expected. Now write the minimum implementation to make it pass.`,
+      message: `RED confirmed: "${this._targetTest}" is failing. Now write the minimum implementation to make it pass.`,
     };
   }
 
-  /**
-   * Advance from RED → GREEN after run_tests shows the target test passing.
-   *
-   * @param {object} testResult - Structured result from run_tests
-   * @returns {{ ok: boolean, phase: string, message: string }}
-   */
   advanceToGreen(testResult) {
     if (this.disabled) return { ok: true, phase: 'idle', message: 'TDD gating disabled.' };
     if (this._phase !== PHASES.RED) {
@@ -160,29 +278,28 @@ class TDDStateMachine {
       };
     }
 
-    const targetPassing = this._isTargetPassing(testResult);
-    if (!targetPassing) {
+    if (!this._isTargetPassing(testResult)) {
       return {
         ok: false,
         phase: PHASES.RED,
-        message: `"${this._targetTest}" is still failing. Fix the implementation until it passes, then advance to GREEN.`,
+        message: `"${this._targetTest}" is still failing. Fix the implementation, then call run_tests again.`,
       };
     }
 
     this._phase = PHASES.GREEN;
     this._save();
 
+    const loopHint = this._loopActive
+      ? ' Call tdd_advance (or skip to next requirement via tdd_advance with skip_refactor=true).'
+      : ' Enter REFACTOR or start the next cycle.';
+
     return {
       ok: true,
       phase: PHASES.GREEN,
-      message: `GREEN: "${this._targetTest}" is now passing. You may enter REFACTOR phase or commit and start the next cycle.`,
+      message: `GREEN: "${this._targetTest}" is now passing.${loopHint}`,
     };
   }
 
-  /**
-   * Enter the REFACTOR phase from GREEN.
-   * @returns {{ ok: boolean, phase: string, message: string }}
-   */
   enterRefactor() {
     if (this.disabled) return { ok: true, phase: 'idle', message: 'TDD gating disabled.' };
     if (this._phase !== PHASES.GREEN) {
@@ -195,16 +312,10 @@ class TDDStateMachine {
     return {
       ok: true,
       phase: PHASES.REFACTOR,
-      message: 'REFACTOR phase. Make structural improvements — do not change behavior. Run full suite to verify no regressions.',
+      message: 'REFACTOR: make structural improvements only. Run full suite to verify no regressions.',
     };
   }
 
-  /**
-   * Complete the cycle from REFACTOR → IDLE after a clean full-suite run.
-   *
-   * @param {object} testResult - Full-suite run_tests result
-   * @returns {{ ok: boolean, phase: string, message: string }}
-   */
   completeCycle(testResult) {
     if (this.disabled) return { ok: true, phase: 'idle', message: 'TDD gating disabled.' };
     if (this._phase !== PHASES.REFACTOR) {
@@ -217,135 +328,155 @@ class TDDStateMachine {
       return {
         ok: false,
         phase: PHASES.REFACTOR,
-        message: `Regression detected after refactor: ${testResult.failed} failing test(s)${names ? ': ' + names : ''}. Fix before completing the cycle.`,
+        message: `Regression: ${testResult.failed} failing test(s)${names ? ': ' + names : ''}. Fix before completing the cycle.`,
       };
     }
 
-    const prevTarget = this._targetTest;
-    this._phase = PHASES.IDLE;
-    this._targetTest = null;
-    this._redConfirmed = false;
-    this._startedAt = null;
-    this._save();
-
-    return {
-      ok: true,
-      phase: PHASES.IDLE,
-      message: `Cycle complete for "${prevTarget}". Full suite is clean. Ready for the next cycle.`,
-    };
+    return this._finishCycle('refactor', testResult);
   }
 
-  /**
-   * Skip the refactor phase and go directly back to idle from GREEN.
-   * @returns {{ ok: boolean, phase: string, message: string }}
-   */
   skipRefactor() {
     if (this.disabled) return { ok: true, phase: 'idle', message: 'TDD gating disabled.' };
     if (this._phase !== PHASES.GREEN) {
       return { ok: false, phase: this._phase, message: `skipRefactor called but phase is "${this._phase}", expected "green".` };
     }
-
-    const prevTarget = this._targetTest;
-    this._phase = PHASES.IDLE;
-    this._targetTest = null;
-    this._redConfirmed = false;
-    this._startedAt = null;
-    this._save();
-
-    return {
-      ok: true,
-      phase: PHASES.IDLE,
-      message: `Cycle complete (refactor skipped) for "${prevTarget}". Ready for the next cycle.`,
-    };
+    return this._finishCycle('green', null);
   }
 
-  /**
-   * Reset to idle unconditionally. Use if the cycle is abandoned.
-   */
   reset() {
     this._phase = PHASES.IDLE;
     this._targetTest = null;
     this._redConfirmed = false;
     this._startedAt = null;
+    this._requirements = [];
+    this._loopActive = false;
+    this._regressionClean = false;
     this._save();
     return { ok: true, phase: PHASES.IDLE, message: 'TDD state reset to idle.' };
   }
 
   // ─── Phase prompt injection ─────────────────────────────────────────────────
 
-  /**
-   * Returns a brief prompt string to inject into the system context so the
-   * model knows which TDD phase it's in. Returns '' in idle phase.
-   */
   phasePrompt() {
-    if (this.disabled || this._phase === PHASES.IDLE) return '';
+    if (this.disabled) return '';
 
+    const reqProgress = this._loopActive && this._requirements.length > 0
+      ? this._formatRequirementsChecklist()
+      : '';
+
+    if (this._phase === PHASES.IDLE) {
+      if (!this._loopActive || this._requirements.length === 0) return '';
+      if (this.loopComplete()) {
+        return `\n\n[TDD LOOP: COMPLETE — all ${this._requirements.length} requirements fulfilled]\n${reqProgress}`;
+      }
+      if (this.allRequirementsDone()) {
+        return `\n\n[TDD LOOP: all tests green — run run_tests (full suite) to confirm no regressions]\n${reqProgress}`;
+      }
+      // There is an active requirement waiting for a cycle to begin
+      const active = this.activeRequirement();
+      const current = active || this.pendingRequirements()[0];
+      const nextText = current ? `"${current.text}"` : 'the next requirement';
+      return `\n\n[TDD LOOP: ${this.doneRequirements().length}/${this._requirements.length} done — idle]\n${reqProgress}\nNext: write a failing test for ${nextText}, then call tdd_begin_cycle.`;
+    }
+
+    const header = this._loopActive
+      ? `[TDD LOOP: ${this.doneRequirements().length}/${this._requirements.length} done — ${this._phase.toUpperCase()} phase]`
+      : `[TDD: ${this._phase.toUpperCase()} phase]`;
+
+    let body = '';
     switch (this._phase) {
       case PHASES.RED:
-        if (!this._redConfirmed) {
-          return `\n\n[TDD: RED phase — target test: "${this._targetTest}"]\n` +
-            'You MUST call run_tests first to confirm this test FAILS before writing any implementation code. ' +
-            'Do NOT write implementation until red is confirmed.';
-        }
-        return `\n\n[TDD: RED phase (confirmed) — target test: "${this._targetTest}"]\n` +
-          'The test is failing as expected. Write the MINIMUM implementation to make it pass. ' +
-          'Do NOT edit the test file. Do NOT add extra logic beyond what the test requires.';
-
+        body = !this._redConfirmed
+          ? `Target test: "${this._targetTest}"\nYou MUST call run_tests (test_filter="${this._targetTest}") to confirm it FAILS before writing implementation.`
+          : `Target test: "${this._targetTest}" — RED confirmed.\nWrite the MINIMUM implementation to make it pass. Do NOT edit the test file.`;
+        break;
       case PHASES.GREEN:
-        return `\n\n[TDD: GREEN phase — target test: "${this._targetTest}"]\n` +
-          'The test is passing. Do NOT modify test files. ' +
-          'You may enter REFACTOR phase or commit and call tdd_begin_cycle for the next test.';
-
+        body = `Target test: "${this._targetTest}" is passing.\nDo NOT modify test files. Call tdd_advance to enter REFACTOR or skip to the next requirement.`;
+        break;
       case PHASES.REFACTOR:
-        return `\n\n[TDD: REFACTOR phase — target test: "${this._targetTest}"]\n` +
-          'Make structural improvements only — no behavior changes. ' +
-          'When done, call run_tests (full suite) and confirm no regressions before completing the cycle.';
-
-      default:
-        return '';
+        body = `Target test: "${this._targetTest}"\nStructural cleanup only. Call run_tests (full suite) then tdd_advance to complete this requirement.`;
+        break;
     }
+
+    return `\n\n${header}\n${reqProgress ? reqProgress + '\n' : ''}${body}`;
   }
 
   // ─── Guards ────────────────────────────────────────────────────────────────
 
-  /**
-   * Returns a warning injection string if the proposed tool call violates
-   * the current TDD phase rules, or null if the call is allowed.
-   *
-   * @param {string} toolName
-   * @param {object} toolArgs
-   * @returns {string|null}
-   */
   checkToolCall(toolName, toolArgs) {
     if (this.disabled || this._phase === PHASES.IDLE) return null;
-    const isWrite = toolName === 'write_file' || toolName === 'patch' || toolName === 'append_file' || toolName === 'read_and_patch';
+    const isWrite = toolName === 'write_file' || toolName === 'patch'
+      || toolName === 'append_file' || toolName === 'read_and_patch';
     if (!isWrite) return null;
 
     const filePath = toolArgs && (toolArgs.path || '');
     const isTestFile = _isTestFile(filePath);
 
     if (this._phase === PHASES.RED && !this._redConfirmed && !isTestFile) {
-      return `[TDD-GATE] You are in the RED phase but have NOT yet confirmed the test is failing. ` +
-        `Call run_tests first (with test_filter "${this._targetTest}") to confirm it fails. ` +
-        `Do not write implementation until you have a confirmed failing test.`;
+      return `[TDD-GATE] RED phase — NOT YET confirmed red. Call run_tests (test_filter="${this._targetTest}") first to confirm this test fails. Do not write implementation yet.`;
     }
 
     if (this._phase === PHASES.GREEN && isTestFile) {
-      return `[TDD-GATE] You are in the GREEN phase. Do NOT modify test files. ` +
-        `Only edit implementation files to make "${this._targetTest}" pass. ` +
-        `If you need to change the test, reset the TDD cycle first (call tdd_reset).`;
+      return `[TDD-GATE] GREEN phase — do NOT modify test files. Edit only implementation files. To change the test, call tdd_reset and start a new cycle.`;
     }
 
     return null;
   }
 
-  // ─── Helpers ───────────────────────────────────────────────────────────────
+  // ─── Internal ──────────────────────────────────────────────────────────────
+
+  _finishCycle(fromPhase, testResult) {
+    const prevTarget = this._targetTest;
+    this._phase = PHASES.IDLE;
+    this._targetTest = null;
+    this._redConfirmed = false;
+    this._startedAt = null;
+
+    // In loop mode: find which requirement this cycle was for, mark it done,
+    // and auto-advance to the next one.
+    if (this._loopActive) {
+      const activeReq = this.activeRequirement();
+      if (activeReq) {
+        const loopResult = this._completeRequirement(activeReq.id);
+        this._save();
+
+        if (loopResult.next) {
+          // Auto-begin next cycle in the state machine (but don't write tests —
+          // that's the model's job; we just advance the loop pointer).
+          return {
+            ok: true,
+            phase: PHASES.IDLE,
+            loopAdvanced: true,
+            nextRequirement: loopResult.next,
+            message: `${loopResult.message}\n\nNext action: write a failing test for "${loopResult.next.text}", then call tdd_begin_cycle.`,
+          };
+        }
+
+        // All requirements done — check regression
+        this._save();
+        return {
+          ok: true,
+          phase: PHASES.IDLE,
+          loopAdvanced: false,
+          allDone: true,
+          message: `${loopResult.message}`,
+        };
+      }
+    }
+
+    // Single-cycle mode
+    this._save();
+    return {
+      ok: true,
+      phase: PHASES.IDLE,
+      message: `Cycle complete (${fromPhase}) for "${prevTarget}". Ready for the next cycle.`,
+    };
+  }
 
   _isTargetFailing(testResult) {
     if (!testResult) return false;
     if (testResult.exitCode !== 0) return true;
     if (testResult.failed > 0 || testResult.errors > 0) return true;
-    // If filter was used, we may have no results — treat exit-code as the signal
     return false;
   }
 
@@ -353,9 +484,16 @@ class TDDStateMachine {
     if (!testResult) return false;
     if (testResult.exitCode !== 0) return false;
     if (testResult.failed > 0 || testResult.errors > 0) return false;
-    // If we ran with a filter and the suite was empty, that's ambiguous — require passed > 0
     if (testResult.passed === 0 && testResult.failed === 0) return false;
     return true;
+  }
+
+  _formatRequirementsChecklist() {
+    if (this._requirements.length === 0) return '';
+    return this._requirements.map(r => {
+      const mark = r.status === REQ_STATUS.DONE ? '✓' : r.status === REQ_STATUS.ACTIVE ? '→' : '○';
+      return `  ${mark} ${r.id}: ${r.text}`;
+    }).join('\n');
   }
 
   // ─── Persistence ───────────────────────────────────────────────────────────
@@ -370,13 +508,16 @@ class TDDStateMachine {
         redConfirmed: this._redConfirmed,
         cycleId: this._cycleId,
         startedAt: this._startedAt,
+        requirements: this._requirements,
+        loopActive: this._loopActive,
+        regressionClean: this._regressionClean,
         updatedAt: new Date().toISOString(),
       };
       const tmp = this._stateFile + `.tmp.${process.pid}`;
       fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: FILE_MODE });
       fs.renameSync(tmp, this._stateFile);
     } catch {
-      // Non-fatal — in-memory state is still correct
+      // Non-fatal
     }
   }
 
@@ -391,6 +532,9 @@ class TDDStateMachine {
         this._redConfirmed = !!state.redConfirmed;
         this._cycleId = state.cycleId || 0;
         this._startedAt = state.startedAt || null;
+        this._requirements = Array.isArray(state.requirements) ? state.requirements : [];
+        this._loopActive = !!state.loopActive;
+        this._regressionClean = !!state.regressionClean;
       }
     } catch {
       // Corrupt state file — stay at idle
@@ -399,7 +543,6 @@ class TDDStateMachine {
 }
 
 // ─── File classification ──────────────────────────────────────────────────────
-// Heuristic: a file is a "test file" if its name matches common test patterns.
 
 const TEST_FILE_PATTERNS = [
   /test_.*\.py$/i,
@@ -435,14 +578,13 @@ function getTDDState(options) {
   return _instance;
 }
 
-function resetTDDState() {
-  _instance = null;
-}
+function resetTDDState() { _instance = null; }
 
 module.exports = {
   TDDStateMachine,
   getTDDState,
   resetTDDState,
   PHASES,
-  _isTestFile, // exported for tests
+  REQ_STATUS,
+  _isTestFile,
 };

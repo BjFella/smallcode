@@ -688,6 +688,17 @@ async function executeTool(name, args, ctx) {
       return { result: tddMessage ? `${formatted}\n\n[TDD] ${tddMessage}` : formatted, testResult };
     }
 
+    case 'tdd_loop': {
+      const { getTDDState } = require('../src/session/tdd_state');
+      const { resetTDDGovernor } = require('../src/governor/tdd_governor');
+      const tdd = getTDDState({ workdir: cwd });
+      // Fresh loop — reset governor singleton so it picks up the new state
+      resetTDDGovernor();
+      const reqs = Array.isArray(args.requirements) ? args.requirements : [];
+      const r = tdd.initRequirements(reqs);
+      return { result: r.ok ? r.message : `tdd_loop error: ${r.message}` };
+    }
+
     case 'tdd_begin_cycle': {
       const { getTDDState } = require('../src/session/tdd_state');
       const tdd = getTDDState({ workdir: cwd });
@@ -698,14 +709,36 @@ async function executeTool(name, args, ctx) {
     case 'tdd_status': {
       const { getTDDState, PHASES } = require('../src/session/tdd_state');
       const tdd = getTDDState({ workdir: cwd });
-      if (tdd.isIdle()) return { result: 'TDD phase: idle — no active cycle. Call tdd_begin_cycle to start.' };
-      const confirmed = tdd.phase === PHASES.RED ? (tdd.redConfirmed ? ' (red confirmed)' : ' (awaiting red confirmation)') : '';
-      const lines = [
-        `TDD phase: ${tdd.phase}${confirmed}`,
-        `Target test: ${tdd.targetTest}`,
-        tdd.phasePrompt().trim(),
-      ];
-      return { result: lines.filter(Boolean).join('\n') };
+      const lines = [];
+
+      if (tdd.loopActive && tdd.requirements.length > 0) {
+        const done = tdd.doneRequirements().length;
+        const total = tdd.requirements.length;
+        lines.push(`TDD Loop: ${done}/${total} requirements done${tdd.loopComplete() ? ' ✓ COMPLETE' : ''}`);
+        lines.push('Requirements:');
+        for (const r of tdd.requirements) {
+          const mark = r.status === 'done' ? '✓' : r.status === 'active' ? '→' : '○';
+          lines.push(`  ${mark} ${r.id}: ${r.text}`);
+        }
+        lines.push('');
+      }
+
+      if (tdd.isIdle() && !tdd.loopActive) {
+        return { result: 'TDD: idle — no active cycle. Call tdd_loop or tdd_begin_cycle to start.' };
+      }
+
+      if (!tdd.isIdle()) {
+        const confirmed = tdd.phase === PHASES.RED
+          ? (tdd.redConfirmed ? ' (red confirmed)' : ' (awaiting red confirmation)')
+          : '';
+        lines.push(`Phase: ${tdd.phase}${confirmed}`);
+        if (tdd.targetTest) lines.push(`Target test: ${tdd.targetTest}`);
+      }
+
+      const prompt = tdd.phasePrompt().trim();
+      if (prompt) lines.push('', prompt);
+
+      return { result: lines.join('\n') };
     }
 
     case 'tdd_advance': {

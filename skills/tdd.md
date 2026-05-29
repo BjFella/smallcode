@@ -1,45 +1,68 @@
 ---
 name: tdd
 trigger: match
-keywords: [test, tdd, implement, feature, bugfix]
+keywords: [test, tdd, implement, feature, bugfix, requirements]
 ---
 
 # Test-Driven Development
 
-Strict red/green/refactor for small models that over-implement.
+Strict Red → Green → Refactor loop for small models that over-implement. Can drive a single test cycle or a full requirements loop.
 
-## Cycle
+## Quick start — requirements loop
 
-1. **Write the failing test first.** Call `tdd_begin_cycle` with the test name to enter the RED phase.
-2. **Confirm red.** Call `run_tests` with `test_filter` set to the new test name. The TDD state machine will auto-confirm RED if the test fails. Do NOT write implementation until red is confirmed.
-3. **Minimum code to pass.** Write only the code the test requires. No extra logic. No preemptive abstractions.
-4. **Confirm green.** Call `run_tests` again. The state machine will auto-advance to GREEN if the target test passes.
-5. **Refactor (optional).** Call `tdd_advance` to enter the REFACTOR phase. Make structural improvements, then call `run_tests` (full suite) to verify no regressions. The state machine will complete the cycle on a clean run.
+```
+tdd_loop(requirements=[
+  "add() returns the sum of two numbers",
+  "add() raises TypeError on non-numeric input",
+  "add() handles negative numbers"
+])
+```
+
+The agent will work through every requirement in order using the cycle below. The loop only exits when all requirements have passing tests **and** a clean full-suite run confirms no regressions.
+
+## Cycle (per requirement)
+
+1. **Write the failing test.** One test, one behaviour.
+2. **Call `tdd_begin_cycle(test_name)`** to enter the RED phase.
+3. **Call `run_tests(test_filter=<name>)`** to confirm the test fails. The state machine auto-confirms RED and gates implementation until this step is done.
+4. **Write minimum implementation** — only what the test requires.
+5. **Call `run_tests(test_filter=<name>)`** again. The machine auto-advances to GREEN when the target passes.
+6. **Call `tdd_advance`** to enter REFACTOR (or `skip_refactor=true` to skip straight to the next requirement).
+7. In REFACTOR: make structural improvements. Call `run_tests` (full suite). The machine completes the cycle and auto-starts the next requirement.
 
 ## State machine tools
 
 | Tool | When to call |
 |------|-------------|
-| `tdd_begin_cycle` | After writing the new test, before running anything |
-| `run_tests` | At every phase boundary — the machine auto-transitions |
-| `tdd_status` | To check current phase and what is required next |
-| `tdd_advance` | To trigger a phase transition (green→refactor, refactor→idle) |
-| `tdd_reset` | To abandon the current cycle |
+| `tdd_loop(requirements)` | Entry point for requirement-driven work |
+| `tdd_begin_cycle(test_name)` | After writing the failing test |
+| `run_tests(test_filter?)` | At every phase boundary — machine auto-transitions |
+| `tdd_status` | Check current phase, requirements checklist, what's next |
+| `tdd_advance` | Move GREEN → REFACTOR → next requirement |
+| `tdd_reset` | Abandon the current loop/cycle |
 
-## Phase gates enforced automatically
+## Phase gates (enforced automatically)
 
 - **RED (unconfirmed):** writing implementation files is blocked until `run_tests` confirms the target test fails.
 - **GREEN:** modifying test files is blocked.
-- **REFACTOR→IDLE:** completing the cycle is blocked until `run_tests` confirms the full suite is clean.
+- **Loop completion:** calling anything "done" is blocked until `run_tests` confirms the full suite is clean after all requirements are green.
+
+## Loop completion condition
+
+The loop is **only complete** when:
+1. Every requirement's test is passing (all GREEN).
+2. A full-suite `run_tests` (no filter) confirms no regressions.
+
+The model cannot declare success before both conditions are met.
 
 ## Rules
 
-- One behavior per test. Commit each green state.
+- One test per requirement. Commit each green state.
 - Never batch test + implementation in one commit.
-- Bug fixes: write a regression test that fails on the old behavior, then fix.
-- Use `run_tests` (not bare `bash`) for all test runs during TDD — the structured output drives the state machine.
+- Bug fixes: write a regression test that fails on the old behaviour, then fix.
+- Use `run_tests` (not bare `bash`) — the structured output drives the state machine.
 
 ## SmallCode tips
 
-- After green, `memory_remember` type `workflow` if you discovered a project-specific test command or quirk.
-- `run_tests test_filter` narrows to a single test — faster red-phase confirmation on large suites.
+- `run_tests(test_filter=<name>)` narrows to a single test — faster red-phase confirmation.
+- After loop completion, `memory_remember` type `workflow` if you found a project-specific test quirk.

@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-const { TDDStateMachine, PHASES, _isTestFile } = require('../src/session/tdd_state');
+const { TDDStateMachine, PHASES, REQ_STATUS, _isTestFile } = require('../src/session/tdd_state');
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -397,4 +397,181 @@ test('full Red→Green→Refactor→Idle cycle completes cleanly', () => {
   assert.equal(s.completeCycle(CLEAN_SUITE).ok, true);
   assert.equal(s.phase, PHASES.IDLE);
   assert.equal(s.targetTest, null);
+});
+
+// ─── Requirements loop ────────────────────────────────────────────────────────
+
+test('initRequirements registers requirements as pending', () => {
+  const s = makeState();
+  const r = s.initRequirements(['add returns sum', 'subtract returns diff']);
+  assert.equal(r.ok, true);
+  assert.equal(s.requirements.length, 2);
+  assert.ok(s.loopActive);
+  assert.ok(s.requirements.every(req => req.status === REQ_STATUS.PENDING));
+});
+
+test('initRequirements rejects empty array', () => {
+  const s = makeState();
+  assert.equal(s.initRequirements([]).ok, false);
+  assert.equal(s.initRequirements(null).ok, false);
+});
+
+test('initRequirements resets any in-flight cycle', () => {
+  const s = makeState();
+  s.beginCycle('test_foo');
+  s.initRequirements(['req 1']);
+  assert.equal(s.phase, PHASES.IDLE);
+  assert.equal(s.targetTest, null);
+});
+
+test('beginCycle in loop mode marks first pending requirement as active', () => {
+  const s = makeState();
+  s.initRequirements(['add returns sum', 'subtract returns diff']);
+  s.beginCycle('test_add');
+  assert.equal(s.activeRequirement().text, 'add returns sum');
+  assert.equal(s.activeRequirement().status, REQ_STATUS.ACTIVE);
+});
+
+test('allRequirementsDone is false until all are done', () => {
+  const s = makeState();
+  s.initRequirements(['req1', 'req2']);
+  assert.equal(s.allRequirementsDone(), false);
+});
+
+test('loop auto-advances to next requirement after skipRefactor', () => {
+  const s = makeState();
+  s.initRequirements(['add returns sum', 'subtract returns diff']);
+
+  // Complete first requirement
+  s.beginCycle('test_add');
+  s.confirmRed(FAILING_RESULT);
+  s.advanceToGreen(PASSING_RESULT);
+  const r = s.skipRefactor();
+
+  assert.equal(r.ok, true);
+  assert.ok(r.loopAdvanced, 'loop should have advanced');
+  assert.ok(r.nextRequirement, 'should have a next requirement');
+  assert.equal(r.nextRequirement.text, 'subtract returns diff');
+  assert.equal(s.phase, PHASES.IDLE);
+  assert.equal(s.doneRequirements().length, 1);
+  assert.equal(s.pendingRequirements().length, 0); // active, not pending
+  assert.equal(s.activeRequirement().text, 'subtract returns diff');
+});
+
+test('loop auto-advances after completeCycle', () => {
+  const s = makeState();
+  s.initRequirements(['req1', 'req2']);
+  s.beginCycle('test_req1');
+  s.confirmRed(FAILING_RESULT);
+  s.advanceToGreen(PASSING_RESULT);
+  s.enterRefactor();
+  const r = s.completeCycle(CLEAN_SUITE);
+  assert.equal(r.ok, true);
+  assert.ok(r.loopAdvanced);
+  assert.equal(s.doneRequirements().length, 1);
+});
+
+test('allRequirementsDone after completing all requirements', () => {
+  const s = makeState();
+  s.initRequirements(['req1', 'req2']);
+
+  // Complete req1
+  s.beginCycle('test_req1');
+  s.confirmRed(FAILING_RESULT);
+  s.advanceToGreen(PASSING_RESULT);
+  s.skipRefactor();
+
+  // Complete req2
+  s.beginCycle('test_req2');
+  s.confirmRed(FAILING_RESULT);
+  s.advanceToGreen(PASSING_RESULT);
+  s.skipRefactor();
+
+  assert.equal(s.allRequirementsDone(), true);
+  assert.equal(s.loopComplete(), false); // regression not yet confirmed
+});
+
+test('markRegressionClean completes the loop', () => {
+  const s = makeState();
+  s.initRequirements(['req1']);
+  s.beginCycle('test_req1');
+  s.confirmRed(FAILING_RESULT);
+  s.advanceToGreen(PASSING_RESULT);
+  s.skipRefactor();
+
+  assert.equal(s.allRequirementsDone(), true);
+  s.markRegressionClean();
+  assert.equal(s.loopComplete(), true);
+});
+
+test('markRegressionClean returns false when requirements not all done', () => {
+  const s = makeState();
+  s.initRequirements(['req1', 'req2']);
+  s.beginCycle('test_req1');
+  s.confirmRed(FAILING_RESULT);
+  s.advanceToGreen(PASSING_RESULT);
+  s.skipRefactor(); // only req1 done
+  assert.equal(s.markRegressionClean(), false);
+  assert.equal(s.loopComplete(), false);
+});
+
+test('phasePrompt shows requirements checklist in loop mode', () => {
+  const s = makeState();
+  s.initRequirements(['req1', 'req2']);
+  s.beginCycle('test_req1');
+  const prompt = s.phasePrompt();
+  assert.match(prompt, /TDD LOOP/);
+  assert.match(prompt, /req1/);
+  assert.match(prompt, /req2/);
+});
+
+test('phasePrompt shows loop progress (done/total)', () => {
+  const s = makeState();
+  s.initRequirements(['req1', 'req2']);
+  s.beginCycle('test_req1');
+  s.confirmRed(FAILING_RESULT);
+  s.advanceToGreen(PASSING_RESULT);
+  s.skipRefactor();
+  // Now on req2, 1/2 done
+  const prompt = s.phasePrompt();
+  assert.match(prompt, /1\/2/);
+});
+
+test('phasePrompt shows COMPLETE when loop is done', () => {
+  const s = makeState();
+  s.initRequirements(['req1']);
+  s.beginCycle('test_req1');
+  s.confirmRed(FAILING_RESULT);
+  s.advanceToGreen(PASSING_RESULT);
+  s.skipRefactor();
+  s.markRegressionClean();
+  const prompt = s.phasePrompt();
+  assert.match(prompt, /COMPLETE/i);
+});
+
+test('reset clears requirements and loop state', () => {
+  const s = makeState();
+  s.initRequirements(['req1', 'req2']);
+  s.beginCycle('test_req1');
+  s.reset();
+  assert.equal(s.phase, PHASES.IDLE);
+  assert.equal(s.loopActive, false);
+  assert.equal(s.requirements.length, 0);
+});
+
+test('loop state persists and reloads', () => {
+  const stateFile = path.join(os.tmpdir(), `tdd_loop_persist_${Math.random().toString(36).slice(2)}.json`);
+  const s1 = new TDDStateMachine({ workdir: os.tmpdir(), stateFile });
+  s1.initRequirements(['add returns sum', 'subtract returns diff']);
+  s1.beginCycle('test_add');
+  s1.confirmRed(FAILING_RESULT);
+
+  const s2 = new TDDStateMachine({ workdir: os.tmpdir(), stateFile });
+  assert.equal(s2.loopActive, true);
+  assert.equal(s2.requirements.length, 2);
+  assert.equal(s2.phase, PHASES.RED);
+  assert.equal(s2.redConfirmed, true);
+  assert.equal(s2.activeRequirement().text, 'add returns sum');
+
+  try { fs.unlinkSync(stateFile); } catch {}
 });

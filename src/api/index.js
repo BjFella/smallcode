@@ -238,6 +238,7 @@ Rules:
       { type: 'function', function: { name: 'search', description: 'Search file contents using regex. Returns matching lines.', parameters: { type: 'object', properties: { pattern: { type: 'string', description: 'Regex pattern' } }, required: ['pattern'] } } },
       { type: 'function', function: { name: 'find_files', description: 'Find files matching a glob pattern.', parameters: { type: 'object', properties: { pattern: { type: 'string', description: 'Glob pattern' } }, required: ['pattern'] } } },
       { type: 'function', function: { name: 'run_tests', description: 'Run the project\'s test suite and return structured results: pass/fail counts and per-failing-test names and messages.', parameters: { type: 'object', properties: { test_filter: { type: 'string', description: 'Optional: run only tests matching this pattern.' } }, required: [] } } },
+      { type: 'function', function: { name: 'tdd_loop', description: 'Start a TDD loop for a list of requirements. Loops through Red→Green→(Refactor) for each requirement until all pass.', parameters: { type: 'object', properties: { requirements: { type: 'array', items: { type: 'string' }, description: 'List of requirements.' } }, required: ['requirements'] } } },
       { type: 'function', function: { name: 'tdd_begin_cycle', description: 'Start a TDD cycle for a named test, entering the RED phase.', parameters: { type: 'object', properties: { test_name: { type: 'string', description: 'Test identifier to track.' } }, required: ['test_name'] } } },
       { type: 'function', function: { name: 'tdd_status', description: 'Show current TDD phase and target test.', parameters: { type: 'object', properties: {}, required: [] } } },
       { type: 'function', function: { name: 'tdd_advance', description: 'Advance the TDD cycle to the next phase.', parameters: { type: 'object', properties: { skip_refactor: { type: 'boolean' } }, required: [] } } },
@@ -347,6 +348,14 @@ Rules:
         return { result: tddMessage ? `${formatted}\n\n[TDD] ${tddMessage}` : formatted };
       }
 
+      case 'tdd_loop': {
+        const { getTDDState } = require('../session/tdd_state');
+        const { resetTDDGovernor } = require('../governor/tdd_governor');
+        resetTDDGovernor();
+        const r = getTDDState({ workdir: cwd }).initRequirements(Array.isArray(args.requirements) ? args.requirements : []);
+        return { result: r.ok ? r.message : `tdd_loop error: ${r.message}` };
+      }
+
       case 'tdd_begin_cycle': {
         const { getTDDState } = require('../session/tdd_state');
         const r = getTDDState({ workdir: cwd }).beginCycle(args.test_name || '');
@@ -356,9 +365,19 @@ Rules:
       case 'tdd_status': {
         const { getTDDState, PHASES } = require('../session/tdd_state');
         const tdd = getTDDState({ workdir: cwd });
-        if (tdd.isIdle()) return { result: 'TDD phase: idle — no active cycle.' };
-        const confirmed = tdd.phase === PHASES.RED ? (tdd.redConfirmed ? ' (confirmed)' : ' (unconfirmed)') : '';
-        return { result: `TDD phase: ${tdd.phase}${confirmed}\nTarget: ${tdd.targetTest}\n${tdd.phasePrompt().trim()}` };
+        const lines = [];
+        if (tdd.loopActive && tdd.requirements.length > 0) {
+          lines.push(`TDD Loop: ${tdd.doneRequirements().length}/${tdd.requirements.length} done${tdd.loopComplete() ? ' ✓' : ''}`);
+          for (const r of tdd.requirements) {
+            lines.push(`  ${r.status === 'done' ? '✓' : r.status === 'active' ? '→' : '○'} ${r.id}: ${r.text}`);
+          }
+        }
+        if (tdd.isIdle() && !tdd.loopActive) return { result: 'TDD: idle — no active cycle.' };
+        if (!tdd.isIdle()) {
+          const confirmed = tdd.phase === PHASES.RED ? (tdd.redConfirmed ? ' (confirmed)' : ' (unconfirmed)') : '';
+          lines.push(`Phase: ${tdd.phase}${confirmed}`, `Target: ${tdd.targetTest}`);
+        }
+        return { result: lines.join('\n') };
       }
 
       case 'tdd_advance': {
