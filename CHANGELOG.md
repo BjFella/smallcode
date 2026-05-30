@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.5.2] - 2026-05-30
 
 ### fix: restore terminal on suspend, termination, and crashes (#71)
 
