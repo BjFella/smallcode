@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.5.0] - 2026-05-29
+
+### feat: TDD harness — Red→Green→Refactor state machine (#68)
+
+Adds an opt-in test-driven-development harness that drives small models
+through a disciplined Red→Green→Refactor cycle. Contributed by
+@scardoso-lu.
+
+- New tools: `run_tests` (runs the suite and returns structured
+  pass/fail counts + per-failure names/messages — far easier for small
+  models to parse than raw `bash` output), plus `tdd_loop`,
+  `tdd_begin_cycle`, `tdd_status`, and `tdd_advance` for cycle control.
+- New modules: `src/session/tdd_state.js` (the phase state machine),
+  `src/governor/tdd_governor.js` (auto-advances phases after each
+  `run_tests` and gates writes by phase), `src/tools/run_tests.js`
+  (cross-runner: pytest / jest / vitest / go test / cargo / mocha /
+  rspec), and a `skills/tdd.md` guide.
+- Fully opt-in: phase enforcement and write-gating are no-ops until a
+  loop/cycle is started; all hooks are wrapped in try/catch so existing
+  flows are untouched.
+- Test coverage: `test/tdd_state.test.js`, `test/tdd_governor.test.js`,
+  `test/tdd_harness.test.js`, `test/run_tests.test.js` (~105 cases).
+  Full suite: 267 passing.
+
 ## [1.4.0] - 2026-05-29
 
 ### feat: RAG coding harness with Python scraper + hybrid search (#64)
